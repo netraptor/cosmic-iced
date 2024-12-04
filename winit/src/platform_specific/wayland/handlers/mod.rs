@@ -2,14 +2,16 @@
 pub mod activation;
 pub mod compositor;
 pub mod output;
+pub mod overlap;
 pub mod seat;
 pub mod session_lock;
 pub mod shell;
 pub mod subcompositor;
+pub mod toplevel;
 pub mod wp_fractional_scaling;
 pub mod wp_viewporter;
 
-use sctk::{
+use cctk::sctk::{
     delegate_registry, delegate_shm,
     output::OutputState,
     registry::{ProvidesRegistryState, RegistryState},

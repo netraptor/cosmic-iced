@@ -245,6 +245,7 @@ where
         sender: mpsc::UnboundedSender<Event<Message>>,
         receiver: mpsc::UnboundedReceiver<Control>,
         error: Option<Error>,
+        proxy: Proxy<Message>,
 
         #[cfg(target_arch = "wasm32")]
         is_booted: std::rc::Rc<std::cell::RefCell<bool>>,
@@ -274,6 +275,7 @@ where
         sender: event_sender,
         receiver: control_receiver,
         error: None,
+        proxy: proxy.clone(),
 
         #[cfg(target_arch = "wasm32")]
         is_booted: std::rc::Rc::new(std::cell::RefCell::new(false)),
@@ -378,6 +380,7 @@ where
                 self.canvas = window.canvas();
             }
 
+            let proxy = self.proxy.raw.clone();
             let finish_boot = async move {
                 let mut compositor =
                     C::new(graphics_settings, window.clone()).await?;
@@ -390,6 +393,13 @@ where
                     .send(Boot {
                         compositor,
                         is_wayland,
+                        clipboard: Clipboard::connect(
+                            window,
+                            crate::clipboard::ControlSender {
+                                sender: control_sender,
+                                proxy,
+                            },
+                        ),
                     })
                     .ok()
                     .expect("Send boot event");
@@ -636,6 +646,7 @@ where
 struct Boot<C> {
     compositor: C,
     is_wayland: bool,
+    clipboard: Clipboard,
 }
 
 pub(crate) enum Event<Message: 'static> {
@@ -702,6 +713,7 @@ async fn run_instance<'a, P, C>(
     let Boot {
         mut compositor,
         is_wayland,
+        mut clipboard,
     } = boot.await.expect("Receive boot");
 
     let mut platform_specific_handler =
@@ -781,7 +793,6 @@ async fn run_instance<'a, P, C>(
             rustc_hash::FxBuildHasher,
         >,
     > = ManuallyDrop::new(FxHashMap::default());
-    let mut clipboard = Clipboard::unconnected();
 
     let mut cur_dnd_surface: Option<window::Id> = None;
 
@@ -937,11 +948,6 @@ async fn run_instance<'a, P, C>(
                                     size,
                                     state.viewport().scale_factor(),
                                 );
-                                let mut surface = compositor.create_surface(
-                                    window.raw.clone(),
-                                    viewport.physical_width(),
-                                    viewport.physical_height(),
-                                );
 
                                 let mut ui = UserInterface::build(
                                     e,
@@ -959,9 +965,10 @@ async fn run_instance<'a, P, C>(
                                     },
                                     Default::default(),
                                 );
+                                platform_specific_handler
+                                    .clear_subsurface_list();
                                 let mut bytes = compositor.screenshot(
                                     &mut renderer,
-                                    &mut surface,
                                     &viewport,
                                     core::Color::TRANSPARENT,
                                     &debug.overlay(),
@@ -1630,6 +1637,7 @@ async fn run_instance<'a, P, C>(
                             cursor,
                         )
                     };
+                    platform_specific_handler.clear_subsurface_list();
 
                     if new_mouse_interaction != window.mouse_interaction {
                         if let Some(interaction) =
@@ -2183,7 +2191,6 @@ where
                 if let Some(window) = window_manager.get_mut(id) {
                     let bytes = compositor.screenshot(
                         &mut window.renderer,
-                        &mut window.surface,
                         window.state.viewport(),
                         window.state.background_color(),
                         &debug.overlay(),

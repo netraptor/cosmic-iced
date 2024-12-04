@@ -18,11 +18,14 @@ use dnd::DndSurface;
 use iced_futures::{
     core::{
         event::{
-            wayland::{LayerEvent, PopupEvent, SessionLockEvent},
+            wayland::{
+                LayerEvent, OverlapNotifyEvent, PopupEvent, SessionLockEvent,
+            },
             PlatformSpecific,
         },
-        Clipboard as _,
+        Clipboard as _, Size,
     },
+    event,
     futures::channel::mpsc,
 };
 use iced_graphics::Compositor;
@@ -37,30 +40,33 @@ use iced_runtime::{
     user_interface, Debug,
 };
 
-use sctk::{
-    output::OutputInfo,
-    reexports::{
-        calloop::channel,
-        client::{
-            backend::ObjectId,
-            protocol::{
-                wl_display::WlDisplay, wl_keyboard::WlKeyboard,
-                wl_output::WlOutput, wl_pointer::WlPointer, wl_seat::WlSeat,
-                wl_surface::WlSurface, wl_touch::WlTouch,
+use cctk::{
+    cosmic_protocols::overlap_notify::v1::client::zcosmic_overlap_notification_v1,
+    sctk::{
+        output::OutputInfo,
+        reexports::{
+            calloop::channel,
+            client::{
+                backend::ObjectId,
+                protocol::{
+                    wl_display::WlDisplay, wl_keyboard::WlKeyboard,
+                    wl_output::WlOutput, wl_pointer::WlPointer,
+                    wl_seat::WlSeat, wl_surface::WlSurface, wl_touch::WlTouch,
+                },
+                Proxy, QueueHandle,
             },
-            Proxy, QueueHandle,
+            csd_frame::WindowManagerCapabilities,
         },
-        csd_frame::WindowManagerCapabilities,
-    },
-    seat::{
-        keyboard::{KeyEvent, Modifiers},
-        pointer::{PointerEvent, PointerEventKind},
-        Capability,
-    },
-    session_lock::SessionLockSurfaceConfigure,
-    shell::{
-        wlr_layer::LayerSurfaceConfigure,
-        xdg::{popup::PopupConfigure, window::WindowConfigure},
+        seat::{
+            keyboard::{KeyEvent, Modifiers},
+            pointer::{PointerEvent, PointerEventKind},
+            Capability,
+        },
+        session_lock::SessionLockSurfaceConfigure,
+        shell::{
+            wlr_layer::{Layer, LayerSurfaceConfigure},
+            xdg::{popup::PopupConfigure, window::WindowConfigure},
+        },
     },
 };
 use std::{
@@ -68,7 +74,10 @@ use std::{
     num::NonZeroU32,
     sync::{Arc, Mutex},
 };
-use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
+use wayland_protocols::{
+    ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+    wp::viewporter::client::wp_viewport::WpViewport,
+};
 use winit::{
     dpi::PhysicalSize, event::WindowEvent, event_loop::EventLoopProxy,
     window::WindowId,
@@ -119,6 +128,27 @@ pub enum SctkEvent {
     LayerSurfaceEvent {
         variant: LayerSurfaceEventVariant,
         id: WlSurface,
+    },
+    OverlapToplevelAdd {
+        surface: WlSurface,
+        toplevel: ExtForeignToplevelHandleV1,
+        logical_rect: iced_runtime::core::Rectangle,
+    },
+    OverlapToplevelRemove {
+        surface: WlSurface,
+        toplevel: ExtForeignToplevelHandleV1,
+    },
+    OverlapLayerAdd {
+        surface: WlSurface,
+        namespace: String,
+        identifier: String,
+        exclusive: u32,
+        layer: Option<Layer>,
+        logical_rect: iced_runtime::core::Rectangle,
+    },
+    OverlapLayerRemove {
+        surface: WlSurface,
+        identifier: String,
     },
     PopupEvent {
         variant: PopupEventVariant,
@@ -216,7 +246,7 @@ pub enum WindowEventVariant {
     Configure((NonZeroU32, NonZeroU32), WindowConfigure, WlSurface, bool),
     Size((NonZeroU32, NonZeroU32), WlSurface, bool),
     /// window state changed
-    StateChanged(sctk::reexports::csd_frame::WindowState),
+    StateChanged(cctk::sctk::reexports::csd_frame::WindowState),
     /// Scale Factor
     ScaleFactorChanged(f64, Option<WpViewport>),
 }
@@ -290,7 +320,6 @@ impl SctkEvent {
         compositor: &mut C,
         window_manager: &mut crate::program::WindowManager<P, C>,
         surface_ids: &mut HashMap<ObjectId, SurfaceIdWrapper>,
-        subsurface_ids: &mut HashMap<ObjectId, (i32, i32, window::Id)>,
         sctk_tx: &channel::Sender<super::Action>,
         control_sender: &mpsc::UnboundedSender<Control>,
         proxy: &EventLoopProxy,
@@ -326,13 +355,6 @@ impl SctkEvent {
                     iced_runtime::core::Event::Mouse(mouse::Event::CursorLeft),
                 )),
                 PointerEventKind::Motion { .. } => {
-                    let offset = if let Some((x_offset, y_offset, _)) =
-                        subsurface_ids.get(&variant.surface.id())
-                    {
-                        (*x_offset, *y_offset)
-                    } else {
-                        (0, 0)
-                    };
                     let id = surface_ids
                         .get(&variant.surface.id())
                         .map(|id| id.inner());
@@ -340,11 +362,7 @@ impl SctkEvent {
                         id.clone().and_then(|id| window_manager.get_mut(id))
                     {
                         w.state.set_logical_cursor_pos(
-                            (
-                                variant.position.0 + offset.0 as f64,
-                                variant.position.1 + offset.1 as f64,
-                            )
-                                .into(),
+                            (variant.position.0, variant.position.1).into(),
                         )
                     }
                     events.push((
@@ -352,8 +370,8 @@ impl SctkEvent {
                         iced_runtime::core::Event::Mouse(
                             mouse::Event::CursorMoved {
                                 position: Point::new(
-                                    variant.position.0 as f32 + offset.0 as f32,
-                                    variant.position.1 as f32 + offset.1 as f32,
+                                    variant.position.0 as f32,
+                                    variant.position.1 as f32,
                                 ),
                             },
                         ),
@@ -636,16 +654,14 @@ impl SctkEvent {
                 LayerSurfaceEventVariant::Done => {
                     if let Some(id) = surface_ids.remove(&surface.id()) {
                         if let Some(w) = window_manager.remove(id.inner()) {
+                            clipboard.register_dnd_destination(
+                                DndSurface(Arc::new(Box::new(w.raw.clone()))),
+                                Vec::new(),
+                            );
                             if clipboard
                                 .window_id()
                                 .is_some_and(|id| w.raw.id() == id)
                             {
-                                clipboard.register_dnd_destination(
-                                    DndSurface(Arc::new(Box::new(
-                                        w.raw.clone(),
-                                    ))),
-                                    Vec::new(),
-                                );
                                 *clipboard = Clipboard::unconnected();
                             }
                         }
@@ -808,9 +824,12 @@ impl SctkEvent {
                     surface,
                     first,
                 ) => {
-                    if let Some(w) = surface_ids
-                        .get(&surface.id())
-                        .and_then(|id| window_manager.get_mut(id.inner()))
+                    if let Some((id, w)) =
+                        surface_ids.get(&surface.id()).and_then(|id| {
+                            window_manager
+                                .get_mut(id.inner())
+                                .map(|v| (id.inner(), v))
+                        })
                     {
                         let scale = w.state.scale_factor();
                         let p_w = (configure.new_size.0.max(1) as f64 * scale)
@@ -824,6 +843,26 @@ impl SctkEvent {
                             )),
                             debug,
                         );
+                        if first {
+                            events.push((
+                                Some(id),
+                                iced_runtime::core::Event::Window(
+                                    window::Event::Resized(
+                                        w.state.logical_size(),
+                                    ),
+                                ),
+                            ))
+                        } else {
+                            events.push((
+                                Some(id),
+                                iced_runtime::core::Event::Window(
+                                    window::Event::Opened {
+                                        size: w.state.logical_size(),
+                                        position: Default::default(),
+                                    },
+                                ),
+                            ))
+                        }
                     }
                 }
             },
@@ -1014,7 +1053,34 @@ impl SctkEvent {
 
                         let _ = user_interfaces.insert(surface_id, ui);
                     }
-                    PopupEventVariant::Configure(_, _, _) => {} // TODO
+                    PopupEventVariant::Configure(configure, surface, first) => {
+                        let size = Size::new(
+                            configure.width as f32,
+                            configure.height as f32,
+                        );
+                        if let Some(id) =
+                            surface_ids.get(&surface.id()).map(|id| id.inner())
+                        {
+                            if first {
+                                events.push((
+                                    Some(id),
+                                    iced_runtime::core::Event::Window(
+                                        window::Event::Resized(size),
+                                    ),
+                                ))
+                            } else {
+                                events.push((
+                                    Some(id),
+                                    iced_runtime::core::Event::Window(
+                                        window::Event::Opened {
+                                            size: size,
+                                            position: Default::default(),
+                                        },
+                                    ),
+                                ))
+                            }
+                        }
+                    } // TODO
                     PopupEventVariant::RepositionionedPopup { token: _ } => {}
                     PopupEventVariant::Size(_, _) => {}
                     PopupEventVariant::ScaleFactorChanged(..) => {}
@@ -1160,7 +1226,38 @@ impl SctkEvent {
                     ),
                 );
             }
-            SctkEvent::SessionLockSurfaceConfigure { .. } => {}
+            SctkEvent::SessionLockSurfaceConfigure {
+                surface,
+                configure,
+                first,
+            } => {
+                let size = Size::new(
+                    configure.new_size.0 as f32,
+                    configure.new_size.1 as f32,
+                );
+                if let Some(id) =
+                    surface_ids.get(&surface.id()).map(|id| id.inner())
+                {
+                    if first {
+                        events.push((
+                            Some(id),
+                            iced_runtime::core::Event::Window(
+                                window::Event::Resized(size),
+                            ),
+                        ))
+                    } else {
+                        events.push((
+                            Some(id),
+                            iced_runtime::core::Event::Window(
+                                window::Event::Opened {
+                                    size: size,
+                                    position: Default::default(),
+                                },
+                            ),
+                        ))
+                    }
+                }
+            }
             SctkEvent::SessionLockSurfaceDone { surface } => {
                 if let Some(id) = surface_ids.remove(&surface.id()) {
                     _ = window_manager.remove(id.inner());
@@ -1182,6 +1279,89 @@ impl SctkEvent {
             }
             SctkEvent::Subcompositor(s) => {
                 *subsurface_state = Some(s);
+            }
+            SctkEvent::OverlapToplevelAdd {
+                surface,
+                toplevel,
+                logical_rect,
+            } => {
+                if let Some(id) = surface_ids.get(&surface.id()) {
+                    events.push((
+                        Some(id.inner()),
+                        iced_runtime::core::Event::PlatformSpecific(
+                            PlatformSpecific::Wayland(
+                                wayland::Event::OverlapNotify(
+                                    OverlapNotifyEvent::OverlapToplevelAdd {
+                                        toplevel,
+                                        logical_rect,
+                                    },
+                                ),
+                            ),
+                        ),
+                    ))
+                }
+            }
+            SctkEvent::OverlapToplevelRemove { surface, toplevel } => {
+                if let Some(id) = surface_ids.get(&surface.id()) {
+                    events.push((
+                        Some(id.inner()),
+                        iced_runtime::core::Event::PlatformSpecific(
+                            PlatformSpecific::Wayland(
+                                wayland::Event::OverlapNotify(
+                                    OverlapNotifyEvent::OverlapToplevelRemove {
+                                        toplevel,
+                                    },
+                                ),
+                            ),
+                        ),
+                    ))
+                }
+            }
+            SctkEvent::OverlapLayerAdd {
+                surface,
+                namespace,
+                identifier,
+                exclusive,
+                layer,
+                logical_rect,
+            } => {
+                if let Some(id) = surface_ids.get(&surface.id()) {
+                    events.push((
+                        Some(id.inner()),
+                        iced_runtime::core::Event::PlatformSpecific(
+                            PlatformSpecific::Wayland(
+                                wayland::Event::OverlapNotify(
+                                    OverlapNotifyEvent::OverlapLayerAdd {
+                                        identifier,
+                                        namespace,
+                                        exclusive,
+                                        layer,
+                                        logical_rect,
+                                    },
+                                ),
+                            ),
+                        ),
+                    ))
+                }
+            }
+            SctkEvent::OverlapLayerRemove {
+                surface,
+                identifier,
+            } => {
+                if let Some(id) = surface_ids.get(&surface.id()) {
+                    events.push((
+                        Some(id.inner()),
+                        iced_runtime::core::Event::PlatformSpecific(
+                            PlatformSpecific::Wayland(
+                                wayland::Event::OverlapNotify(
+                                    OverlapNotifyEvent::OverlapLayerRemove {
+                                        identifier,
+                                    },
+                                ),
+                            ),
+                        ),
+                    ))
+                }
             }
         }
     }

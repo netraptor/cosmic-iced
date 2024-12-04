@@ -10,13 +10,13 @@ pub mod winit_window;
 use super::{PlatformSpecific, SurfaceIdWrapper};
 use crate::program::{Control, Program, WindowManager};
 
+use cctk::sctk::reexports::calloop;
+use cctk::sctk::reexports::client::protocol::wl_surface::WlSurface;
+use cctk::sctk::seat::keyboard::Modifiers;
 use iced_futures::futures::channel::mpsc;
 use iced_graphics::Compositor;
 use iced_runtime::core::window;
 use iced_runtime::Debug;
-use sctk::reexports::calloop;
-use sctk::reexports::client::protocol::wl_surface::WlSurface;
-use sctk::seat::keyboard::Modifiers;
 use sctk_event::SctkEvent;
 use std::{collections::HashMap, sync::Arc};
 use subsurface_widget::{SubsurfaceInstance, SubsurfaceState};
@@ -63,7 +63,6 @@ pub(crate) struct WaylandSpecific {
     modifiers: Modifiers,
     surface_ids: HashMap<ObjectId, SurfaceIdWrapper>,
     destroyed_surface_ids: HashMap<ObjectId, SurfaceIdWrapper>,
-    subsurface_ids: HashMap<ObjectId, (i32, i32, window::Id)>,
     subsurface_state: Option<SubsurfaceState>,
     surface_subsurfaces: HashMap<window::Id, Vec<SubsurfaceInstance>>,
 }
@@ -138,7 +137,6 @@ impl WaylandSpecific {
             display_handle,
             surface_ids,
             destroyed_surface_ids,
-            subsurface_ids,
             modifiers,
             subsurface_state,
             surface_subsurfaces,
@@ -165,7 +163,6 @@ impl WaylandSpecific {
                     compositor,
                     window_manager,
                     surface_ids,
-                    subsurface_ids,
                     sender,
                     event_sender,
                     proxy,
@@ -181,6 +178,10 @@ impl WaylandSpecific {
         };
     }
 
+    pub(crate) fn clear_subsurface_list(&mut self) {
+        let _ = crate::subsurface_widget::take_subsurfaces();
+    }
+
     pub(crate) fn update_subsurfaces(
         &mut self,
         id: window::Id,
@@ -194,8 +195,6 @@ impl WaylandSpecific {
         };
 
         subsurface_state.update_subsurfaces(
-            id,
-            &mut self.subsurface_ids,
             wl_surface,
             surface_subsurfaces,
             &subsurfaces,

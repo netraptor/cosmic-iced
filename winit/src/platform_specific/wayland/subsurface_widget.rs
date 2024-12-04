@@ -21,8 +21,7 @@ use std::{
 };
 
 use crate::futures::futures::channel::oneshot;
-use iced_futures::core::window;
-use sctk::{
+use cctk::sctk::{
     compositor::SurfaceData,
     globals::GlobalData,
     reexports::client::{
@@ -30,6 +29,7 @@ use sctk::{
         protocol::{
             wl_buffer::{self, WlBuffer},
             wl_compositor::WlCompositor,
+            wl_output,
             wl_shm::{self, WlShm},
             wl_shm_pool::{self, WlShmPool},
             wl_subcompositor::WlSubcompositor,
@@ -39,6 +39,7 @@ use sctk::{
         Connection, Dispatch, Proxy, QueueHandle,
     },
 };
+use iced_futures::core::window;
 use wayland_backend::client::ObjectId;
 use wayland_protocols::wp::{
     alpha_modifier::v1::client::{
@@ -157,6 +158,20 @@ impl SubsurfaceBuffer {
                 _sender,
             }));
         (subsurface_buffer, SubsurfaceBufferRelease(receiver))
+    }
+
+    pub fn width(&self) -> i32 {
+        match &*self.0.source {
+            BufferSource::Dma(dma) => dma.width,
+            BufferSource::Shm(shm) => shm.width,
+        }
+    }
+
+    pub fn height(&self) -> i32 {
+        match &*self.0.source {
+            BufferSource::Dma(dma) => dma.height,
+            BufferSource::Shm(shm) => shm.height,
+        }
     }
 
     // Behavior of `wl_buffer::released` is undefined if attached to multiple surfaces. To allow
@@ -347,7 +362,7 @@ impl SubsurfaceState {
         let wp_viewport = self.wp_viewporter.get_viewport(
             &wl_surface,
             &self.qh,
-            sctk::globals::GlobalData,
+            cctk::sctk::globals::GlobalData,
         );
 
         let wp_alpha_modifier_surface =
@@ -362,14 +377,13 @@ impl SubsurfaceState {
             wp_alpha_modifier_surface,
             wl_buffer: None,
             bounds: None,
+            transform: wl_output::Transform::Normal,
         }
     }
 
     // Update `subsurfaces` from `view_subsurfaces`
     pub(crate) fn update_subsurfaces(
         &mut self,
-        parent_id: window::Id,
-        subsurface_ids: &mut HashMap<ObjectId, (i32, i32, window::Id)>,
         parent: &WlSurface,
         subsurfaces: &mut Vec<SubsurfaceInstance>,
         view_subsurfaces: &[SubsurfaceInfo],
@@ -405,16 +419,7 @@ impl SubsurfaceState {
         for (subsurface_data, subsurface) in
             view_subsurfaces.iter().zip(subsurfaces.iter_mut())
         {
-            subsurface.attach_and_commit(
-                parent_id,
-                subsurface_ids,
-                subsurface_data,
-                self,
-            );
-        }
-
-        if let Some(backend) = parent.backend().upgrade() {
-            subsurface_ids.retain(|k, _| backend.info(k.clone()).is_ok());
+            subsurface.attach_and_commit(subsurface_data, self);
         }
     }
 
@@ -472,14 +477,13 @@ pub(crate) struct SubsurfaceInstance {
     wp_alpha_modifier_surface: Option<WpAlphaModifierSurfaceV1>,
     wl_buffer: Option<WlBuffer>,
     bounds: Option<Rectangle<f32>>,
+    transform: wl_output::Transform,
 }
 
 impl SubsurfaceInstance {
     // TODO correct damage? no damage/commit if unchanged?
     fn attach_and_commit(
         &mut self,
-        parent_id: window::Id,
-        subsurface_ids: &mut HashMap<ObjectId, (i32, i32, window::Id)>,
         info: &SubsurfaceInfo,
         state: &mut SubsurfaceState,
     ) {
@@ -527,11 +531,15 @@ impl SubsurfaceInstance {
                 info.bounds.height as i32,
             );
         }
+        let transform_changed = self.transform != info.transform;
+        if transform_changed {
+            self.wl_surface.set_buffer_transform(info.transform);
+        }
         if buffer_changed {
             self.wl_surface.attach(Some(&buffer), 0, 0);
             self.wl_surface.damage(0, 0, i32::MAX, i32::MAX);
         }
-        if buffer_changed || bounds_changed {
+        if buffer_changed || bounds_changed || transform_changed {
             _ = self.wl_surface.frame(&state.qh, self.wl_surface.clone());
             self.wl_surface.commit();
         }
@@ -542,13 +550,9 @@ impl SubsurfaceInstance {
             wp_alpha_modifier_surface.set_multiplier(alpha);
         }
 
-        _ = subsurface_ids.insert(
-            self.wl_surface.id(),
-            (info.bounds.x as i32, info.bounds.y as i32, parent_id),
-        );
-
         self.wl_buffer = Some(buffer);
         self.bounds = Some(info.bounds);
+        self.transform = info.transform;
     }
 
     pub fn unmap(&self) {
@@ -572,6 +576,7 @@ pub(crate) struct SubsurfaceInfo {
     pub buffer: SubsurfaceBuffer,
     pub bounds: Rectangle<f32>,
     pub alpha: f32,
+    pub transform: wl_output::Transform,
 }
 
 thread_local! {
@@ -583,17 +588,16 @@ pub(crate) fn take_subsurfaces() -> Vec<SubsurfaceInfo> {
 }
 
 #[must_use]
-pub struct Subsurface<'a> {
-    buffer_size: Size<f32>,
-    buffer: &'a SubsurfaceBuffer,
+pub struct Subsurface {
+    buffer: SubsurfaceBuffer,
     width: Length,
     height: Length,
     content_fit: ContentFit,
     alpha: f32,
+    transform: wl_output::Transform,
 }
 
-impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
-    for Subsurface<'a>
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Subsurface
 where
     Renderer: renderer::Renderer,
 {
@@ -608,10 +612,21 @@ where
         _renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let raw_size =
-            limits.resolve(self.width, self.height, self.buffer_size);
+        let (width, height) = match self.transform {
+            wl_output::Transform::_90
+            | wl_output::Transform::_270
+            | wl_output::Transform::Flipped90
+            | wl_output::Transform::Flipped270 => {
+                (self.buffer.height(), self.buffer.width())
+            }
+            _ => (self.buffer.width(), self.buffer.height()),
+        };
+        let buffer_size = Size::new(width as f32, height as f32);
 
-        let full_size = self.content_fit.fit(self.buffer_size, raw_size);
+        // TODO apply transform
+        let raw_size = limits.resolve(self.width, self.height, buffer_size);
+
+        let full_size = self.content_fit.fit(buffer_size, raw_size);
 
         let final_size = Size {
             width: match self.width {
@@ -644,25 +659,22 @@ where
                 buffer: self.buffer.clone(),
                 bounds: layout.bounds(),
                 alpha: self.alpha,
+                transform: self.transform,
             })
         });
     }
 }
 
-impl<'a> Subsurface<'a> {
-    pub fn new(
-        buffer_width: u32,
-        buffer_height: u32,
-        buffer: &'a SubsurfaceBuffer,
-    ) -> Self {
+impl Subsurface {
+    pub fn new(buffer: SubsurfaceBuffer) -> Self {
         Self {
-            buffer_size: Size::new(buffer_width as f32, buffer_height as f32),
             buffer,
             // Matches defaults of image widget
             width: Length::Shrink,
             height: Length::Shrink,
             content_fit: ContentFit::Contain,
             alpha: 1.,
+            transform: wl_output::Transform::Normal,
         }
     }
 
@@ -685,15 +697,20 @@ impl<'a> Subsurface<'a> {
         self.alpha = alpha;
         self
     }
+
+    pub fn transform(mut self, transform: wl_output::Transform) -> Self {
+        self.transform = transform;
+        self
+    }
 }
 
-impl<'a, Message, Theme, Renderer> From<Subsurface<'a>>
-    for Element<'a, Message, Theme, Renderer>
+impl<Message, Theme, Renderer> From<Subsurface>
+    for Element<'static, Message, Theme, Renderer>
 where
-    Message: Clone + 'a,
+    Message: Clone,
     Renderer: renderer::Renderer,
 {
-    fn from(subsurface: Subsurface<'a>) -> Self {
+    fn from(subsurface: Subsurface) -> Self {
         Self::new(subsurface)
     }
 }

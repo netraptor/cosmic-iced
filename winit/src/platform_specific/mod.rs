@@ -59,6 +59,13 @@ impl PlatformSpecific {
         }
     }
 
+    pub(crate) fn clear_subsurface_list(&mut self) {
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        {
+            self.wayland.clear_subsurface_list();
+        }
+    }
+
     pub(crate) fn update_subsurfaces(
         &mut self,
         id: window::Id,
@@ -66,7 +73,7 @@ impl PlatformSpecific {
     ) {
         #[cfg(all(feature = "wayland", target_os = "linux"))]
         {
-            use sctk::reexports::client::{
+            use cctk::sctk::reexports::client::{
                 protocol::wl_surface::WlSurface, Proxy,
             };
             use wayland_backend::client::ObjectId;
@@ -86,7 +93,9 @@ impl PlatformSpecific {
                             wayland_display_handle.display.as_ptr().cast(),
                         )
                     };
-                    sctk::reexports::client::Connection::from_backend(backend)
+                    cctk::sctk::reexports::client::Connection::from_backend(
+                        backend,
+                    )
                 }
                 _ => {
                     return;
