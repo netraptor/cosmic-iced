@@ -7,6 +7,8 @@ pub struct PlatformSpecific {
     pub title_hidden: bool,
     /// Makes the titlebar transparent and allows the content to appear behind it.
     pub titlebar_transparent: bool,
+    /// Hides the window titlebar.
+    pub titlebar_hidden: bool,
     /// Makes the window content appear behind the titlebar.
     pub fullsize_content_view: bool,
 }

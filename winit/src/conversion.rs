@@ -101,6 +101,7 @@ pub fn window_attributes(
             .with_titlebar_transparent(
                 settings.platform_specific.titlebar_transparent,
             )
+            .with_titlebar_hidden(settings.platform_specific.titlebar_hidden)
             .with_fullsize_content_view(
                 settings.platform_specific.fullsize_content_view,
             );
